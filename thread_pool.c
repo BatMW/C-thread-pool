@@ -1,12 +1,12 @@
 #include "thread_pool.h"
-#include "../memory/pool_allocator.h"
+#include "pool_allocator.h"
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 struct Thread_Pool_Queue* task_head;
 struct Thread_Pool_Queue* task_tail;
-struct MEM_Pool_Allocator task_allocator;
+struct Pool_Allocator task_allocator;
 struct cthreads_mutex task_lock;
 struct cthreads_semaphore nr_tasks;
 
@@ -19,18 +19,30 @@ struct thread_node{
 struct thread_node* thread_list;
 size_t thread_list_size;
 
+size_t thread_pool_calculate_mem_requirements(const size_t max_tasks, const size_t max_threads){
+  size_t total = pool_allocator_calculate_mem_requirements(sizeof(struct Thread_Pool_Task), max_tasks);
+  if(total == 0){
+    printf("pool allocator mem req failed\n");
+  }
+  total += sizeof(struct thread_node)*max_threads;
+  return total;
+}
 
-bool thread_pool_init(size_t max_size, size_t max_threads){
+
+bool thread_pool_init(size_t max_tasks, size_t max_threads, void* storage){
   static bool init = false;
   if(init == true) return true;
-  task_allocator = MEM_pool_allocator_init(sizeof(struct Thread_Pool_Queue), max_size);
-  if (task_allocator.base == NULL)return 1;
-  thread_list = malloc(sizeof(struct thread_node)*max_threads);
+  task_allocator = pool_allocator_init(storage, sizeof(struct Thread_Pool_Task), max_tasks);
+  printf("init: task_allocator->base == %lu\n", task_allocator.base);
+  if (task_allocator.base == 0)return false;
+
+  uintptr_t pool_end = task_allocator.base + (task_allocator.block_size * task_allocator.nr_blocks);
+  thread_list = (struct thread_node*)pool_end;
   if (thread_list == NULL){
-    MEM_pool_allocator_destroy(&task_allocator);
+    pool_allocator_destroy(&task_allocator);
     return false;
   }
-  for(int i=0; i<max_threads; ++i){
+  for(size_t i=0; i<max_threads; ++i){
     thread_list[i].close = true;
     thread_list[i].state = UNUSED;
   }
@@ -39,6 +51,7 @@ bool thread_pool_init(size_t max_size, size_t max_threads){
   cthreads_mutex_init(&task_lock, NULL);
   cthreads_sem_init(&nr_tasks, 0);
   thread_list_size = max_threads;
+
   return true;
 }
 
@@ -48,7 +61,7 @@ static struct Thread_Pool_Task* thread_pool_retrieve(void){
   if(task_head == NULL) goto exit; //empty
   struct Thread_Pool_Queue* next = task_head->next;
   ret = task_head->task;
-  MEM_pool_allocator_free(&task_allocator, task_head);
+  pool_allocator_free(&task_allocator, task_head);
   if(task_head == task_tail){ //last node
     task_head = NULL;
     task_tail = NULL;
@@ -63,7 +76,8 @@ exit:
 bool thread_pool_add(struct Thread_Pool_Task* task){
   if(task == NULL) return false;
   cthreads_mutex_lock(&task_lock);
-  struct Thread_Pool_Queue* new_task_node = (struct Thread_Pool_Queue*)MEM_pool_allocator_alloc(&task_allocator);
+  //printf("add: task_allocator->base == %lu\n", task_allocator.base);
+  struct Thread_Pool_Queue* new_task_node = (struct Thread_Pool_Queue*)pool_allocator_alloc(&task_allocator);
   if(new_task_node == NULL) goto error;
   new_task_node->task = task;
   if(task_head == NULL){
@@ -80,18 +94,21 @@ exit:
   cthreads_mutex_unlock(&task_lock);
   return true;
 error:
+  printf("Error: thread_pool_add.\n");
   cthreads_mutex_unlock(&task_lock);
   return false;
 }
 
 
 static void* worker_thread(void* void_thread_node){
+  printf("Worker started...\n");
   struct thread_node* thread_ptr = (struct thread_node*)void_thread_node;
   struct Thread_Pool_Task* curr_task = NULL;
   while(1){
     thread_ptr->state = FREE;
     cthreads_sem_wait(&nr_tasks); //sleep until there are tasks
     if(thread_ptr->close){
+      printf("Thread closing.\n");
       break;
     }
     thread_ptr->state = BUSY;
@@ -99,8 +116,8 @@ static void* worker_thread(void* void_thread_node){
     if(curr_task == NULL){
       continue;
     }
-    printf("New task[%ld]\n", (thread_ptr - (struct thread_node*)thread_list));
-    curr_task->ret = curr_task->func(curr_task->arg);
+    //printf("New task[%ld]\n", (thread_ptr - (struct thread_node*)thread_list));
+    curr_task->func(curr_task->arg);
     cthreads_sem_post(curr_task->done);
 
   }
@@ -113,34 +130,40 @@ int thread_pool_start(size_t nr_threads){
     return 0;
   }
   size_t cnt = 0;
-  for(int i=0; i< thread_list_size; ++i){
+  for(size_t i=0; i< thread_list_size; ++i){
     if(thread_list[i].state == UNUSED){
       thread_list[i].close = false;
       thread_list[i].state = FREE;
-      cthreads_thread_create(&thread_list[i].thread, NULL, worker_thread, &thread_list[i], NULL);
-      cnt++;
-      if(cnt == nr_threads){
-        return cnt;
+      struct cthreads_args args = {.func = worker_thread, .data = NULL};
+      int success = cthreads_thread_create(&thread_list[i].thread, NULL, worker_thread, &thread_list[i], &args);
+      if(success == 0){
+        cnt++;
+        if(cnt == nr_threads){
+          return cnt;
+        }
+      }else{
+        printf("Thread %lu failed  to start.\n", i);
       }
+
     }
   }
   return cnt;
 }
 
 void thread_pool_destroy(void){
-  for(int i=0; i< thread_list_size; ++i){
+  for(size_t i=0; i< thread_list_size; ++i){
     thread_list[i].close = true;
   }
-  for(int i=0; i< thread_list_size; ++i){
+  for(size_t i=0; i< thread_list_size; ++i){
     cthreads_sem_post(&nr_tasks);
     cthreads_sem_post(&nr_tasks);
   }
-  for(int i=0; i< thread_list_size; ++i){
+  for(size_t i=0; i< thread_list_size; ++i){
     if(thread_list[i].state != UNUSED){
       cthreads_thread_join(thread_list[i].thread, NULL);
       thread_list[i].state = UNUSED;
     }
   }
-  free(thread_list);
-  MEM_pool_allocator_destroy(&task_allocator);
+  //free(thread_list);
+  //pool_allocator_destroy(&task_allocator);
 }
