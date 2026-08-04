@@ -51,6 +51,10 @@ size_t storage_size = thread_pool_calculate_mem_requirements(NR_TASKS, NR_THREAD
 
 thread_pool_add(&task);
 
+// the pool can be started before the tasks are added...
+int started_threads = thread_pool_start(NR_THREADS);
+printf("Started %i threads.\n", started_threads);
+
 cthreads_sem_wait(task.done);
 thread_pool_destroy();
 free(storage);
